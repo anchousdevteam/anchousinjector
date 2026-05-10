@@ -17,7 +17,7 @@ fn main() -> eframe::Result<()> {
             .with_icon(std::sync::Arc::new(load_icon())),
         ..Default::default()
     };
-    eframe::run_native("anchous injector", options, Box::new(|cc| {
+    eframe::run_native("anchous injector 0.2.0", options, Box::new(|cc| {
         egui_extras::install_image_loaders(&cc.egui_ctx);
         Box::new(App::new(cc))
     }))
