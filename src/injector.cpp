@@ -37,7 +37,16 @@ public:
         SIZE_T written = 0;
         return WriteProcessMemory(hProcess, address, buffer, size, &written) && written == size;
     }
-    ~ProcessMemory() { if (address) VirtualFreeEx(hProcess, address, 0, MEM_RELEASE); }
+    // ВНИМАНИЕ: Мы НЕ удаляем память в деструкторе автоматически здесь, 
+    // так как LoadLibraryW в другом процессе может не успеть отработать.
+    // Освободим её вручную после завершения потока.
+    void free() {
+        if (address) {
+            VirtualFreeEx(hProcess, address, 0, MEM_RELEASE);
+            address = nullptr;
+        }
+    }
+    ~ProcessMemory() { /* Авто-удаление убрано для стабильности потока */ }
 };
 
 // Функция инъекции в конкретный PID
@@ -50,23 +59,39 @@ InjectionResult InjectIntoPID(DWORD processId, LPCWSTR path, SIZE_T pathSize) {
     if (!remoteAddr) return InjectionResult::VirtualAllocExFailed;
 
     ProcessMemory mem(hProcOwned, remoteAddr);
-    if (!mem.write(path, pathSize)) return InjectionResult::WriteProcessMemoryFailed;
+    if (!mem.write(path, pathSize)) {
+        mem.free();
+        return InjectionResult::WriteProcessMemoryFailed;
+    }
 
-    auto loadLib = (LPTHREAD_START_ROUTINE)GetProcAddress(GetModuleHandleW(L"KERNEL32.DLL"), "LoadLibraryW");
-    if (!loadLib) return InjectionResult::CreateRemoteThreadFailed;
+    // --- ФИКС ВОРНИНГА ЗДЕСЬ ---
+    // Используем reinterpret_cast через void* чтобы убрать -Wcast-function-type
+    auto loadLib = reinterpret_cast<LPTHREAD_START_ROUTINE>(
+        reinterpret_cast<void*>(GetProcAddress(GetModuleHandleW(L"KERNEL32.DLL"), "LoadLibraryW"))
+    );
+    
+    if (!loadLib) {
+        mem.free();
+        return InjectionResult::CreateRemoteThreadFailed;
+    }
 
     HANDLE hThread = CreateRemoteThread(hProcOwned, nullptr, 0, loadLib, remoteAddr, 0, nullptr);
-    if (!hThread) return InjectionResult::CreateRemoteThreadFailed;
+    if (!hThread) {
+        mem.free();
+        return InjectionResult::CreateRemoteThreadFailed;
+    }
 
     Handle hThreadOwned(hThread);
     WaitForSingleObject(hThreadOwned, INFINITE);
+
+    // Теперь, когда поток завершился, можно безопасно чистить память
+    mem.free();
 
     return InjectionResult::Success;
 }
 
 // Главная функция, вызываемая из Rust
 extern "C" uint8_t run_injection(const wchar_t* processName, const wchar_t* libraryPath) {
-    // Получаем полный путь к DLL, чтобы LoadLibrary в целевом процессе её нашел
     WCHAR fullPath[MAX_PATH];
     if (GetFullPathNameW(libraryPath, MAX_PATH, fullPath, nullptr) == 0) 
         return (uint8_t)InjectionResult::GetFullPathNameWFailed;
